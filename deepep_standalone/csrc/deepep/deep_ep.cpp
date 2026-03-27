@@ -517,7 +517,17 @@ Buffer::intranode_dispatch(const at::Tensor &x, const std::optional<at::Tensor> 
         // before MoeDispatchNormal, so the event fires as soon as the 4-byte copy finishes.
         int actual_recv_tokens = 0;
         {
-            ACL_CHECK(aclrtSynchronizeEvent(recv_token_copy_event));
+            // Flush the task queue so that all enqueued ops (NotifyDispatch,
+            // memcpy+record, MoeDispatchNormal) are submitted to the device stream.
+            // Without this flush, the event query would see an unrecorded event
+            // (initial "complete" state) and return immediately with stale data.
+            c10_npu::getCurrentNPUStream().stream();
+            // Busy-wait polling: keep CPU thread spinning to avoid context-switch
+            // latency from aclrtSynchronizeEvent yielding the thread.
+            aclrtEventRecordedStatus status = ACL_EVENT_RECORDED_STATUS_NOT_READY;
+            do {
+                ACL_CHECK(aclrtQueryEventStatus(recv_token_copy_event, &status));
+            } while (status == ACL_EVENT_RECORDED_STATUS_NOT_READY);
             actual_recv_tokens = *pinned_recv_token_host;
         }
         if (actual_recv_tokens == 0) actual_recv_tokens = 1;
