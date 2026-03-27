@@ -473,7 +473,6 @@ Buffer::intranode_dispatch(const at::Tensor &x, const std::optional<at::Tensor> 
         // Queue async D2H copy of total_recv_token_ right after NotifyDispatch
         // (total_recv_token_ is already written by NotifyDispatch at this point in stream order)
         {
-            auto acl_stream = c10_npu::getCurrentNPUStream().stream();
             // Lazily allocate pinned host buffer and event
             if (!pinned_recv_token_host) {
                 ACL_CHECK(aclrtMallocHost(reinterpret_cast<void **>(&pinned_recv_token_host), sizeof(int)));
@@ -481,12 +480,19 @@ Buffer::intranode_dispatch(const at::Tensor &x, const std::optional<at::Tensor> 
             if (!recv_token_copy_event) {
                 ACL_CHECK(aclrtCreateEvent(&recv_token_copy_event));
             }
-            // Async D2H copy: queued after NotifyDispatch, before MoeDispatchNormal
-            ACL_CHECK(aclrtMemcpyAsync(pinned_recv_token_host, sizeof(int),
-                                       total_recv_token_.data_ptr<int>(), sizeof(int),
-                                       ACL_MEMCPY_DEVICE_TO_HOST, acl_stream));
-            // Record event after the memcpy so we can sync on it independently
-            ACL_CHECK(aclrtRecordEvent(recv_token_copy_event, acl_stream));
+            // Use RunOpApiV2 to enqueue both aclrtMemcpyAsync and aclrtRecordEvent,
+            // using stream(false) to avoid task queue flush.
+            auto *dst = pinned_recv_token_host;
+            auto *src = total_recv_token_.data_ptr<int>();
+            auto evt = recv_token_copy_event;
+            auto acl_call = [dst, src, evt]() -> int {
+                auto acl_stream = c10_npu::getCurrentNPUStream().stream(false);
+                ACL_CHECK(aclrtMemcpyAsync(dst, sizeof(int), src, sizeof(int),
+                                           ACL_MEMCPY_DEVICE_TO_HOST, acl_stream));
+                ACL_CHECK(aclrtRecordEvent(evt, acl_stream));
+                return 0;
+            };
+            at_npu::native::OpCommand::RunOpApiV2("aclrtMemcpyAsync_D2H_RecordEvent", acl_call);
         }
 
         // Use pre-allocated max-size shmem tensors directly (no sync for allocation)
