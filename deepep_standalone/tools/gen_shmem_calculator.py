@@ -260,10 +260,171 @@ def build_calculator_sheet(wb):
         ws.merge_cells(start_row=row + 1 + i, start_column=1, end_row=row + 1 + i, end_column=4)
 
 
-# ── Sheet 2: Reverse Calculator — given max_recv_tokens, compute pool size ───
+# ── Sheet 2: Reverse Calculator A — directly input max_recv_tokens ────────────
 
-def build_reverse_calculator_sheet(wb):
-    ws = wb.create_sheet("反向计算器")
+def build_reverse_direct_sheet(wb):
+    ws = wb.create_sheet("反向计算器A-直接输入")
+
+    _set_col_widths(ws, [28, 24, 18, 50])
+
+    title_font = Font(bold=True, size=14)
+    section_font = Font(bold=True, size=11, color="4472C4")
+    label_align = Alignment(horizontal="right", vertical="center")
+    note_font = Font(italic=True, color="808080", size=9)
+
+    ws.merge_cells("A1:D1")
+    c = ws["A1"]
+    c.value = "反向计算器 A：直接输入 max_recv_tokens → 所需 shmem 池大小"
+    c.font = title_font
+    c.alignment = Alignment(horizontal="center")
+
+    ws.merge_cells("A2:D2")
+    ws["A2"].value = "修改黄色单元格中的值，绿色单元格自动计算所需显存池大小"
+    ws["A2"].font = note_font
+    ws["A2"].alignment = Alignment(horizontal="center")
+
+    # ── Fixed constant ──
+    row = 4
+    ws.cell(row=row, column=1, value="常量").font = section_font
+    ws.cell(row=5, column=1, value="SHMEM_META_DATA_SIZE (字节)").alignment = label_align
+    cell = ws.cell(row=5, column=2, value=100 * 1024 * 1024)
+    apply_style(cell, make_input_style())
+    cell.number_format = "#,##0"
+    ws.cell(row=5, column=4, value="元数据保留 (默认 100MB)").font = note_font
+    meta_cell = "B5"
+
+    # ── Input parameters ──
+    row = 7
+    ws.cell(row=row, column=1, value="输入参数").font = section_font
+    inputs = [
+        ("hidden_size (H)", 7168, "模型隐藏维度"),
+        ("num_experts (E)", 256, "专家总数"),
+        ("world_size (R)", 16, "EP 并行的 rank 总数"),
+        ("use_quant (0或1)", 0, "0=BF16, 1=FP8/INT8 量化"),
+        ("目标 max_recv_tokens", 285000, "期望支持的最大接收 token 数"),
+        ("余量比例 (%)", 10, "建议申请量的额外余量百分比, 如 10 代表 10%"),
+    ]
+    for i, (label, val, note) in enumerate(inputs):
+        r = row + 1 + i
+        ws.cell(row=r, column=1, value=label).alignment = label_align
+        cell = ws.cell(row=r, column=2, value=val)
+        apply_style(cell, make_input_style())
+        cell.number_format = "#,##0"
+        ws.cell(row=r, column=4, value=note).font = note_font
+
+    H = "B8"    # hidden_size
+    E = "B9"    # num_experts
+    R = "B10"   # world_size
+    Q = "B11"   # use_quant
+    T = "B12"   # target max_recv_tokens
+    M = "B13"   # margin percentage
+
+    # ── Calculation steps ──
+    row = 15
+    ws.cell(row=row, column=1, value="计算过程").font = section_font
+    calc_style = make_calc_style()
+    calc_rows = [
+        ("固定开销 (字节)", f"={E}*(1+{R})*4", "E × (1 + R) × 4"),
+        ("单 token 开销 (字节)", f"={H}*2+{Q}*4", "H × 2 + (量化 ? 4 : 0)"),
+        ("数据区所需空间 (字节)", f"={T}*B17", "max_recv_tokens × per_token"),
+        ("所需总池大小 (字节)", f"={meta_cell}+B16+B18", "元数据 + 固定开销 + 数据区"),
+    ]
+    for i, (label, formula, note) in enumerate(calc_rows):
+        r = row + 1 + i
+        ws.cell(row=r, column=1, value=label).alignment = label_align
+        cell = ws.cell(row=r, column=2)
+        cell.value = formula
+        cell.number_format = "#,##0"
+        if i == len(calc_rows) - 1:
+            apply_style(cell, make_result_style())
+        else:
+            apply_style(cell, calc_style)
+        ws.cell(row=r, column=3, value=note).font = note_font
+
+    # ── Tensor breakdown ──
+    row = 21
+    ws.cell(row=row, column=1, value="Shmem Tensor 明细").font = section_font
+    tensor_headers = ["Tensor 名称", "大小 (字节)", "大小 (MB)", "说明"]
+    for col, h_text in enumerate(tensor_headers, start=1):
+        c = ws.cell(row=row + 1, column=col, value=h_text)
+        apply_style(c, make_header_style())
+
+    tensors = [
+        ("SHMEM_META_DATA",          f"={meta_cell}",                   "元数据保留区"),
+        ("num_tokens_per_expert",     f"={E}*4",                         "{E} × kInt"),
+        ("dispatch_shmem_recv_data",  f"={R}*{E}*4",                     "{R, E} × kInt"),
+        ("combine_x (=expandx_out)",  f"={T}*{H}*2",                    "{T, H} × BF16, expandx_out 共享此内存"),
+        ("dynamic_scales_out",        f"=IF({Q}=1, {T}*4, 0)",          "{T} × kFloat, 仅量化时分配"),
+    ]
+    thin_border = Border(
+        left=Side(style="thin"), right=Side(style="thin"),
+        top=Side(style="thin"), bottom=Side(style="thin"),
+    )
+    tensor_start_row = row + 2
+    for i, (name, formula, desc) in enumerate(tensors):
+        r = tensor_start_row + i
+        ws.cell(row=r, column=1, value=name).border = thin_border
+        cell_b = ws.cell(row=r, column=2)
+        cell_b.value = formula
+        cell_b.number_format = "#,##0"
+        cell_b.border = thin_border
+        cell_mb = ws.cell(row=r, column=3)
+        cell_mb.value = f"=B{r}/1024/1024"
+        cell_mb.number_format = "0.000"
+        cell_mb.border = thin_border
+        ws.cell(row=r, column=4, value=desc).border = thin_border
+
+    total_row = tensor_start_row + len(tensors)
+    ws.cell(row=total_row, column=1, value="合计").font = Font(bold=True)
+    ws.cell(row=total_row, column=1).border = thin_border
+    sum_range = f"B{tensor_start_row}:B{total_row - 1}"
+    cell_total = ws.cell(row=total_row, column=2)
+    cell_total.value = f"=SUM({sum_range})"
+    cell_total.number_format = "#,##0"
+    apply_style(cell_total, make_result_style())
+    cell_total_mb = ws.cell(row=total_row, column=3)
+    cell_total_mb.value = f"=B{total_row}/1024/1024"
+    cell_total_mb.number_format = "0.000"
+    apply_style(cell_total_mb, make_result_style())
+    ws.cell(row=total_row, column=4, value="所有 shmem tensor 总用量").border = thin_border
+
+    # ── Result summary ──
+    row = total_row + 2
+    ws.cell(row=row, column=1, value="结果摘要").font = section_font
+    summaries = [
+        ("所需 shmem 池大小 (GB)", "=B19/1024/1024/1024", "0.000"),
+        ("所需 shmem 池大小 (MB)", "=B19/1024/1024", "0.000"),
+        ("建议申请量 (GB, 含余量)", f"=CEILING(B19*(1+{M}/100)/1024/1024/1024, 0.5)", "0.0"),
+        ("固定开销占比", f"=B16/B19", "0.000%"),
+        ("元数据占比", f"={meta_cell}/B19", "0.00%"),
+        ("数据区占比", "=B18/B19", "0.00%"),
+    ]
+    for i, (label, formula, fmt) in enumerate(summaries):
+        r = row + 1 + i
+        ws.cell(row=r, column=1, value=label).alignment = label_align
+        cell = ws.cell(row=r, column=2)
+        cell.value = formula
+        cell.number_format = fmt
+        apply_style(cell, make_result_style())
+
+    # ── Formula reference ──
+    row = row + 1 + len(summaries) + 1
+    ws.cell(row=row, column=1, value="公式参考").font = section_font
+    formulas_text = [
+        "required_pool = META_SIZE + E×(1+R)×4 + max_recv_tokens × (H×2 + quant×4)",
+        "",
+        "反向推导自:",
+        "max_recv_tokens = ⌊ (pool - META_SIZE - E×(1+R)×4) / (H×2 + quant×4) ⌋",
+    ]
+    for i, text in enumerate(formulas_text):
+        ws.cell(row=row + 1 + i, column=1, value=text).font = Font(size=10, name="Consolas")
+        ws.merge_cells(start_row=row + 1 + i, start_column=1, end_row=row + 1 + i, end_column=4)
+
+
+# ── Sheet 3: Reverse Calculator B — estimate from seqLen/topk/imbalance ──────
+
+def build_reverse_estimate_sheet(wb):
+    ws = wb.create_sheet("反向计算器B-推算")
 
     _set_col_widths(ws, [28, 24, 18, 50])
 
@@ -275,7 +436,7 @@ def build_reverse_calculator_sheet(wb):
     # ── Title ──
     ws.merge_cells("A1:D1")
     c = ws["A1"]
-    c.value = "反向计算器：由 max_recv_tokens 推算所需 shmem 池大小"
+    c.value = "反向计算器 B：由 seqLen/topk/不均匀比例 推算所需 shmem 池大小"
     c.font = title_font
     c.alignment = Alignment(horizontal="center")
 
@@ -451,13 +612,15 @@ def build_reverse_calculator_sheet(wb):
 def main():
     wb = openpyxl.Workbook()
     build_calculator_sheet(wb)
-    build_reverse_calculator_sheet(wb)
+    build_reverse_direct_sheet(wb)
+    build_reverse_estimate_sheet(wb)
 
     out = "shmem_calculator.xlsx"
     wb.save(out)
     print(f"✓ 已生成: {out}")
-    print("  Sheet 1 [正向计算器] — 输入 H/E/R/量化 → 算 max_recv_tokens + Tensor 明细")
-    print("  Sheet 2 [反向计算器] — 输入 H/E/R/max_recv_tokens → 算所需池大小 + Tensor 明细")
+    print("  Sheet 1 [正向计算器]         — 输入 H/E/R/量化 → 算 max_recv_tokens + Tensor 明细")
+    print("  Sheet 2 [反向计算器A-直接输入] — 直接输入 max_recv_tokens → 算所需池大小")
+    print("  Sheet 3 [反向计算器B-推算]     — 输入 seqLen/topk/不均匀比例 → 推算所需池大小")
 
 
 if __name__ == "__main__":
