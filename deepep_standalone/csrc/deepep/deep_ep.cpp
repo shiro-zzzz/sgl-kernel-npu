@@ -1,5 +1,6 @@
 #include <memory>
 #include <cmath>
+#include <chrono>
 #include <pybind11/functional.h>
 
 #include "hccl/hccl.h"
@@ -494,7 +495,46 @@ Buffer::intranode_dispatch(const at::Tensor &x, const std::optional<at::Tensor> 
             };
             at_npu::native::OpCommand::RunOpApiV2("aclrtMemcpyAsync_D2H_RecordEvent", acl_call);
         }
+        int actual_recv_tokens = 0;
+        {
+            // --- Timing: T0 = entry point ---
+            auto t0 = std::chrono::high_resolution_clock::now();
 
+            // Flush the task queue so that all enqueued ops (NotifyDispatch,
+            // memcpy+record, MoeDispatchNormal) are submitted to the device stream.
+            // Without this flush, the event query would see an unrecorded event
+            // (initial "complete" state) and return immediately with stale data.
+            c10_npu::getCurrentNPUStream().stream();
+
+            // --- Timing: T1 = after task-queue flush ---
+            auto t1 = std::chrono::high_resolution_clock::now();
+
+            // Busy-wait polling: keep CPU thread spinning to avoid context-switch
+            // latency from aclrtSynchronizeEvent yielding the thread.
+            aclrtEventRecordedStatus status = ACL_EVENT_RECORDED_STATUS_NOT_READY;
+            uint64_t poll_iters = 0;
+            do {
+                ACL_CHECK(aclrtQueryEventStatus(recv_token_copy_event, &status));
+                ++poll_iters;
+            } while (status == ACL_EVENT_RECORDED_STATUS_NOT_READY);
+            actual_recv_tokens = *pinned_recv_token_host;
+
+            // --- Timing: T2 = after polling completes ---
+            auto t2 = std::chrono::high_resolution_clock::now();
+
+            // Compute durations in microseconds
+            auto us_flush = std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
+            auto us_poll  = std::chrono::duration_cast<std::chrono::microseconds>(t2 - t1).count();
+            auto us_total = std::chrono::duration_cast<std::chrono::microseconds>(t2 - t0).count();
+
+            std::cout << "[DeepEP D2H timing] rank=" << rank
+                      << " flush_us=" << us_flush
+                      << " poll_us=" << us_poll
+                      << " total_us=" << us_total
+                      << " poll_iters=" << poll_iters
+                      << " actual_recv_tokens=" << actual_recv_tokens
+                      << std::endl;
+        }
         // Use pre-allocated max-size shmem tensors directly (no sync for allocation)
         EP_HOST_ASSERT(c_shmem_expandx_out.defined());
         expandx_out = c_shmem_expandx_out;
@@ -512,24 +552,24 @@ Buffer::intranode_dispatch(const at::Tensor &x, const std::optional<at::Tensor> 
                      // output params
                      expandx_out, dynamic_scales_out, expand_idx_out, dispatch_wait_recv_cost_stats_out);
 
-        // Sync only the D2H copy event — does NOT wait for MoeDispatchNormal to complete.
-        // total_recv_token_ was produced by NotifyDispatch and the async memcpy was queued
-        // before MoeDispatchNormal, so the event fires as soon as the 4-byte copy finishes.
-        int actual_recv_tokens = 0;
-        {
-            // Flush the task queue so that all enqueued ops (NotifyDispatch,
-            // memcpy+record, MoeDispatchNormal) are submitted to the device stream.
-            // Without this flush, the event query would see an unrecorded event
-            // (initial "complete" state) and return immediately with stale data.
-            c10_npu::getCurrentNPUStream().stream();
-            // Busy-wait polling: keep CPU thread spinning to avoid context-switch
-            // latency from aclrtSynchronizeEvent yielding the thread.
-            aclrtEventRecordedStatus status = ACL_EVENT_RECORDED_STATUS_NOT_READY;
-            do {
-                ACL_CHECK(aclrtQueryEventStatus(recv_token_copy_event, &status));
-            } while (status == ACL_EVENT_RECORDED_STATUS_NOT_READY);
-            actual_recv_tokens = *pinned_recv_token_host;
-        }
+        // // Sync only the D2H copy event — does NOT wait for MoeDispatchNormal to complete.
+        // // total_recv_token_ was produced by NotifyDispatch and the async memcpy was queued
+        // // before MoeDispatchNormal, so the event fires as soon as the 4-byte copy finishes.
+        // int actual_recv_tokens = 0;
+        // {
+        //     // Flush the task queue so that all enqueued ops (NotifyDispatch,
+        //     // memcpy+record, MoeDispatchNormal) are submitted to the device stream.
+        //     // Without this flush, the event query would see an unrecorded event
+        //     // (initial "complete" state) and return immediately with stale data.
+        //     c10_npu::getCurrentNPUStream().stream();
+        //     // Busy-wait polling: keep CPU thread spinning to avoid context-switch
+        //     // latency from aclrtSynchronizeEvent yielding the thread.
+        //     aclrtEventRecordedStatus status = ACL_EVENT_RECORDED_STATUS_NOT_READY;
+        //     do {
+        //         ACL_CHECK(aclrtQueryEventStatus(recv_token_copy_event, &status));
+        //     } while (status == ACL_EVENT_RECORDED_STATUS_NOT_READY);
+        //     actual_recv_tokens = *pinned_recv_token_host;
+        // }
         if (actual_recv_tokens == 0) actual_recv_tokens = 1;
 
         // Slice output tensors to actual received token count
